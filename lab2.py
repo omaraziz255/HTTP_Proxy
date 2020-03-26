@@ -2,7 +2,9 @@
 import sys
 import os
 import enum
+import socket
 
+cache = dict()
 
 class HttpRequestInfo(object):
     """
@@ -56,10 +58,12 @@ class HttpRequestInfo(object):
         debugging and testing.
         """
 
-        print("*" * 50)
-        print("[to_http_string] Implement me!")
-        print("*" * 50)
-        return None
+        string = f"{self.method} {self.requested_path} HTTP/1.0\r\n"
+        for h in self.headers:
+            string += f"{h[0]}: {h[1]}\r\n"
+        string += "\r\n"
+
+        return string
 
     def to_byte_array(self, http_string):
         """
@@ -86,8 +90,7 @@ class HttpErrorResponse(object):
         self.message = message
 
     def to_http_string(self):
-        """ Same as above """
-        pass
+        return f"{self.message} ({self.code})"
 
     def to_byte_array(self, http_string):
         """
@@ -111,6 +114,14 @@ class HttpRequestState(enum.Enum):
     PLACEHOLDER = -1
 
 
+def generateError(state):
+    if state == HttpRequestState.INVALID_INPUT:
+        return HttpErrorResponse(400, "Bad Request")
+    else:
+        return HttpErrorResponse(501, "Not Implemented")
+
+
+
 def entry_point(proxy_port_number):
     """
     Entry point, start your code here.
@@ -119,11 +130,8 @@ def entry_point(proxy_port_number):
     inside it.
     """
 
-    setup_sockets(proxy_port_number)
-    print("*" * 50)
-    print("[entry_point] Implement me!")
-    print("*" * 50)
-    return None
+    proxy = setup_sockets(proxy_port_number)
+    do_socket_logic(proxy)
 
 
 def setup_sockets(proxy_port_number):
@@ -134,23 +142,63 @@ def setup_sockets(proxy_port_number):
     Feel free to delete this function.
     """
     print("Starting HTTP proxy on port:", proxy_port_number)
-
+    proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    proxy_socket.bind(("localhost", proxy_port_number))
+    proxy_socket.listen(20)
     # when calling socket.listen() pass a number
     # that's larger than 10 to avoid rejecting
     # connections automatically.
-    print("*" * 50)
-    print("[setup_sockets] Implement me!")
-    print("*" * 50)
-    return None
+    return proxy_socket
 
 
-def do_socket_logic():
+def do_socket_logic(socket):
     """
     Example function for some helper logic, in case you
     want to be tidy and avoid stuffing the main function.
     Feel free to delete this function.
     """
-    pass
+    while True:
+        client, address = socket.accept()
+    # client.settimeout(10)
+        request = client.recv(2**10)
+        response = http_request_pipeline(address, request)
+        if isinstance(response, HttpErrorResponse):
+            client.sendto(response.to_byte_array(response.to_http_string()), address)
+        else:
+            r = checkCache(response)
+            if r is None:
+                r = fetchServer(response)
+                cacheRequest(response, r)
+            for response in r:
+                client.sendto(response, address)
+        client.close()
+
+
+def checkCache(response):
+    url = response.requested_host + response.requested_path
+    if url in cache.keys():
+        return cache[url]
+    else:
+        return None
+
+
+def cacheRequest(response, r):
+    cache[response.requested_host + response.requested_path] = r
+
+
+def fetchServer(response):
+    data = []
+    response.display()
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    IP = socket.gethostbyname(response.requested_host)
+    server.connect((IP, response.requested_port))
+    server.send(response.to_byte_array(response.to_http_string()))
+    received_data = server.recv(2**15)
+    while len(received_data) > 0:
+        data.append(received_data)
+        received_data = server.recv(2**15)
+    server.close()
+    return data
 
 
 def http_request_pipeline(source_addr, http_raw_data):
@@ -167,13 +215,16 @@ def http_request_pipeline(source_addr, http_raw_data):
     free to change its content
     """
     # Parse HTTP request
+    http_raw_data = http_raw_data.decode("UTF-8")
     parsed = parse_http_request(source_addr, http_raw_data)
+    state = check_http_request_validity(parsed)
+    if state != HttpRequestState.GOOD:
+        http = generateError(state)
+    else:
+        http = parsed
 
     # Validate, sanitize, return Http object.
-    print("*" * 50)
-    print("[http_request_pipeline] Implement me!")
-    print("*" * 50)
-    return None
+    return http
 
 
 def parse_http_request(source_addr, http_raw_data) -> HttpRequestInfo:
@@ -182,12 +233,42 @@ def parse_http_request(source_addr, http_raw_data) -> HttpRequestInfo:
     object.
     it does NOT validate the HTTP request.
     """
-    print("*" * 50)
-    print("[parse_http_request] Implement me!")
-    print("*" * 50)
+
+    components = http_raw_data.split("\r\n")
+    components = list(filter(None, components))
+    methodPathVersion = components[0]
+    method, path, version = methodPathVersion.split(" ")
+    port, headers, requested_host = parse_headers(components[1:])
     # Replace this line with the correct values.
-    ret = HttpRequestInfo(None, None, None, None, None, None)
+    ret = sanitize_http_request(HttpRequestInfo(source_addr, method, requested_host, port, path.strip(), headers))
     return ret
+
+
+def parse_headers(components):
+    port = 80
+    headers = []
+    host = None
+    for c in components:
+        splits = c.split(":")
+        h = (splits[0].strip(), splits[1].strip())
+        if h[0] == "Host":
+            host = h[1]
+        headers.append(h)
+        if len(splits) > 2:
+            port = int(splits[2])
+    return port, headers, host
+
+
+def handlefullURL(path, headers):
+    if path.strip() == "/":
+        return path, headers
+    else:
+        h = "Host"
+        url = path[path.find("//")+2: -1]
+        header = (h, url)
+        headers.insert(0, header)
+    return "/", headers
+
 
 
 def check_http_request_validity(http_request_info: HttpRequestInfo) -> HttpRequestState:
@@ -196,11 +277,31 @@ def check_http_request_validity(http_request_info: HttpRequestInfo) -> HttpReque
     returns:
     One of values in HttpRequestState
     """
-    print("*" * 50)
-    print("[check_http_request_validity] Implement me!")
-    print("*" * 50)
-    # return HttpRequestState.GOOD (for example)
-    return HttpRequestState.PLACEHOLDER
+    state = checkMethod(http_request_info.method)
+    if state != HttpRequestState.GOOD:
+        return state
+    else:
+        state = checkHeaders(http_request_info.requested_host)
+        if state != HttpRequestState.GOOD:
+            return state
+        return HttpRequestState.GOOD
+    # return HttpRequestState.PLACEHOLDER
+
+
+def checkMethod(method):
+    if method == "GET":
+        return HttpRequestState.GOOD
+    elif method in ["PUT", "POST", "DELETE", "HEAD"]:
+        return HttpRequestState.NOT_SUPPORTED
+    else:
+        return HttpRequestState.INVALID_INPUT
+
+
+def checkHeaders(host):
+    if host is None:
+        return HttpRequestState.INVALID_INPUT
+    else:
+        return HttpRequestState.GOOD
 
 
 def sanitize_http_request(request_info: HttpRequestInfo) -> HttpRequestInfo:
@@ -211,11 +312,25 @@ def sanitize_http_request(request_info: HttpRequestInfo) -> HttpRequestInfo:
     sanitized fields
     for example, expand a URL to relative path + Host header.
     """
-    print("*" * 50)
-    print("[sanitize_http_request] Implement me!")
-    print("*" * 50)
-    ret = HttpRequestInfo(None, None, None, None, None, None)
-    return ret
+    path = request_info.requested_path
+    if path.__contains__("http"):
+        index = path.find("/", 8)
+        index2 = path.find("//")+2
+        host = path[index2:index]
+        relative = path[index:]
+        if relative == "":
+            relative = "/"
+        if host.__contains__(":"):
+            splits = host.split(":")
+            splits = list(filter(None, splits))
+            host = splits[0]
+            port = int(splits[1])
+            request_info.requested_port = port
+        request_info.requested_path = relative
+        if request_info.requested_host is None:
+            request_info.headers.insert(0, ("Host", host))
+            request_info.requested_host = host
+    return request_info
 
 #######################################
 # Leave the code below as is.
