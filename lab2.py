@@ -3,8 +3,10 @@ import sys
 import os
 import enum
 import socket
+import threading
 
 cache = dict()
+
 
 class HttpRequestInfo(object):
     """
@@ -35,11 +37,11 @@ class HttpRequestInfo(object):
         self.requested_host = requested_host
         self.requested_port = requested_port
         self.requested_path = requested_path
-        # Headers will be represented as a list of tuples
-        # for example ("Host", "www.google.com")
+        # Headers will be represented as a list of lists
+        # for example ["Host", "www.google.com"]
         # if you get a header as:
         # "Host: www.google.com:80"
-        # convert it to ("Host", "www.google.com") note that the
+        # convert it to ["Host", "www.google.com"] note that the
         # port is removed (because it goes into the request_port variable)
         self.headers = headers
 
@@ -52,6 +54,7 @@ class HttpRequestInfo(object):
         [header]\r\n
         [headers..]\r\n
         \r\n
+        (just join the already existing fields by \r\n)
         You still need to convert this string
         to byte array before sending it to the socket,
         keeping it as a string in this stage is to ease
@@ -121,7 +124,6 @@ def generateError(state):
         return HttpErrorResponse(501, "Not Implemented")
 
 
-
 def entry_point(proxy_port_number):
     """
     Entry point, start your code here.
@@ -159,19 +161,23 @@ def do_socket_logic(socket):
     """
     while True:
         client, address = socket.accept()
-    # client.settimeout(10)
-        request = client.recv(2**10)
-        response = http_request_pipeline(address, request)
-        if isinstance(response, HttpErrorResponse):
-            client.sendto(response.to_byte_array(response.to_http_string()), address)
-        else:
-            r = checkCache(response)
-            if r is None:
-                r = fetchServer(response)
-                cacheRequest(response, r)
-            for response in r:
-                client.sendto(response, address)
-        client.close()
+        thread = threading.Thread(target=clientHandler, args=(client, address))
+        thread.start()
+
+
+def clientHandler(client, address):
+    request = client.recv(2 ** 10)
+    response = http_request_pipeline(address, request)
+    if isinstance(response, HttpErrorResponse):
+        client.sendto(response.to_byte_array(response.to_http_string()), address)
+    else:
+        r = checkCache(response)
+        if r is None:
+            r = fetchServer(response)
+            cacheRequest(response, r)
+        for response in r:
+            client.sendto(response, address)
+    client.close()
 
 
 def checkCache(response):
@@ -204,10 +210,10 @@ def fetchServer(response):
 def http_request_pipeline(source_addr, http_raw_data):
     """
     HTTP request processing pipeline.
-    - Parses the given HTTP request
-    - Validates it
-    - Returns a sanitized HttpRequestInfo or HttpErrorResponse
-        based on request validity.
+    - Validates the given HTTP request and returns
+      an error if an invalid request was given.
+    - Parses it
+    - Returns a sanitized HttpRequestInfo
     returns:
      HttpRequestInfo if the request was parsed correctly.
      HttpErrorResponse if the request was invalid.
@@ -216,31 +222,31 @@ def http_request_pipeline(source_addr, http_raw_data):
     """
     # Parse HTTP request
     http_raw_data = http_raw_data.decode("UTF-8")
-    parsed = parse_http_request(source_addr, http_raw_data)
-    state = check_http_request_validity(parsed)
-    if state != HttpRequestState.GOOD:
-        http = generateError(state)
+    validity = check_http_request_validity(http_raw_data)
+    if validity != HttpRequestState.GOOD:
+        http = generateError(validity)
     else:
-        http = parsed
-
+        http = parse_http_request(source_addr, http_raw_data)
+        sanitize_http_request(http)
+    # Return error if needed, then:
+    # parse_http_request()
+    # sanitize_http_request()
     # Validate, sanitize, return Http object.
     return http
 
 
-def parse_http_request(source_addr, http_raw_data) -> HttpRequestInfo:
+def parse_http_request(source_addr, http_raw_data):
     """
-    This function parses an HTTP request into an HttpRequestInfo
+    This function parses a "valid" HTTP request into an HttpRequestInfo
     object.
-    it does NOT validate the HTTP request.
     """
-
     components = http_raw_data.split("\r\n")
     components = list(filter(None, components))
     methodPathVersion = components[0]
     method, path, version = methodPathVersion.split(" ")
     port, headers, requested_host = parse_headers(components[1:])
     # Replace this line with the correct values.
-    ret = sanitize_http_request(HttpRequestInfo(source_addr, method, requested_host, port, path.strip(), headers))
+    ret = HttpRequestInfo(source_addr, method, requested_host, port, path.strip(), headers)
     return ret
 
 
@@ -250,7 +256,7 @@ def parse_headers(components):
     host = None
     for c in components:
         splits = c.split(":")
-        h = (splits[0].strip(), splits[1].strip())
+        h = [splits[0].strip(), splits[1].strip()]
         if h[0] == "Host":
             host = h[1]
         headers.append(h)
@@ -259,33 +265,65 @@ def parse_headers(components):
     return port, headers, host
 
 
-def handlefullURL(path, headers):
-    if path.strip() == "/":
-        return path, headers
-    else:
-        h = "Host"
-        url = path[path.find("//")+2: -1]
-        header = (h, url)
-        headers.insert(0, header)
-    return "/", headers
-
-
-
-def check_http_request_validity(http_request_info: HttpRequestInfo) -> HttpRequestState:
+def check_http_request_validity(http_raw_data) -> HttpRequestState:
     """
-    Checks if an HTTP response is valid
+    Checks if an HTTP request is valid
     returns:
     One of values in HttpRequestState
     """
-    state = checkMethod(http_request_info.method)
-    if state != HttpRequestState.GOOD:
+    correct = HttpRequestState.GOOD
+    headers = http_raw_data.split("\r\n")[1:]
+    method = http_raw_data.split(" ")[0]
+    path = http_raw_data.split(" ")[1]
+    version = http_raw_data.split(" ")[2]
+    state = checkHeaders(headers)
+    if state != correct:
         return state
-    else:
-        state = checkHeaders(http_request_info.requested_host)
-        if state != HttpRequestState.GOOD:
-            return state
+    state = resolveHost(path, headers)
+    if state != correct:
+        return state
+    state = checkVersion(version)
+    if state != correct:
+        return state
+    state = checkMethod(method)
+    if state != correct:
+        return state
+    # return HttpRequestState.GOOD (for example)
+    return correct
+
+
+def resolveHost(path: str, headers):
+    host = True
+    if path.startswith("/"):
+        host = False
+        for h in headers:
+            line = h.split(":")
+            if line[0].strip() == "Host":
+                host = True
+    if host:
         return HttpRequestState.GOOD
-    # return HttpRequestState.PLACEHOLDER
+    else:
+        return HttpRequestState.INVALID_INPUT
+
+
+def checkVersion(version:str):
+    version = version.strip()[:version.find("\r\n")]
+    if version != "HTTP/1.0" and version != "HTTP/1.1":
+        return HttpRequestState.INVALID_INPUT
+    else:
+        return HttpRequestState.GOOD
+
+
+def checkHeaders(headers):
+    headers = list(filter(None, headers))
+    for h in headers:
+        line = h.split(":")
+        if (len(line) < 2) or (len(line) > 3):
+            return HttpRequestState.INVALID_INPUT
+        elif len(line) == 3:
+            if (line[0].strip() != "Host") or not(str.isnumeric(line[-1].strip())):
+                return HttpRequestState.INVALID_INPUT
+    return HttpRequestState.GOOD
 
 
 def checkMethod(method):
@@ -297,25 +335,18 @@ def checkMethod(method):
         return HttpRequestState.INVALID_INPUT
 
 
-def checkHeaders(host):
-    if host is None:
-        return HttpRequestState.INVALID_INPUT
-    else:
-        return HttpRequestState.GOOD
-
-
-def sanitize_http_request(request_info: HttpRequestInfo) -> HttpRequestInfo:
+def sanitize_http_request(request_info: HttpRequestInfo):
     """
-    Puts an HTTP request on the sanitized (standard form)
+    Puts an HTTP request on the sanitized (standard) form
+    by modifying the input request_info object.
+    for example, expand a full URL to relative path + Host header.
     returns:
-    A modified object of the HttpRequestInfo with
-    sanitized fields
-    for example, expand a URL to relative path + Host header.
+    nothing, but modifies the input object
     """
     path = request_info.requested_path
     if path.__contains__("http"):
         index = path.find("/", 8)
-        index2 = path.find("//")+2
+        index2 = path.find("//") + 2
         host = path[index2:index]
         relative = path[index:]
         if relative == "":
@@ -330,7 +361,7 @@ def sanitize_http_request(request_info: HttpRequestInfo) -> HttpRequestInfo:
         if request_info.requested_host is None:
             request_info.headers.insert(0, ("Host", host))
             request_info.requested_host = host
-    return request_info
+
 
 #######################################
 # Leave the code below as is.
@@ -365,9 +396,11 @@ def check_file_name():
     """
     script_name = os.path.basename(__file__)
     import re
-    matches = re.findall(r"(\d{4}_)lab2\.py", script_name)
+    matches = re.findall(r"(\d{4}_){,2}lab2\.py", script_name)
     if not matches:
         print(f"[WARN] File name is invalid [{script_name}]")
+    else:
+        print(f"[LOG] File name is correct.")
 
 
 def main():
