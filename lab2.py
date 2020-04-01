@@ -221,13 +221,14 @@ def http_request_pipeline(source_addr, http_raw_data):
     free to change its content
     """
     # Parse HTTP request
-    http_raw_data = http_raw_data.decode("UTF-8")
+    http_raw_data = http_raw_data.decode("unicode_escape")
     validity = check_http_request_validity(http_raw_data)
     if validity != HttpRequestState.GOOD:
         http = generateError(validity)
     else:
         http = parse_http_request(source_addr, http_raw_data)
         sanitize_http_request(http)
+        http.display()
     # Return error if needed, then:
     # parse_http_request()
     # sanitize_http_request()
@@ -265,7 +266,7 @@ def parse_headers(components):
     return port, headers, host
 
 
-def check_http_request_validity(http_raw_data) -> HttpRequestState:
+def check_http_request_validity(http_raw_data: str) -> HttpRequestState:
     """
     Checks if an HTTP request is valid
     returns:
@@ -276,6 +277,9 @@ def check_http_request_validity(http_raw_data) -> HttpRequestState:
     method = http_raw_data.split(" ")[0]
     path = http_raw_data.split(" ")[1]
     version = http_raw_data.split(" ")[2]
+    state = checkCRLF(http_raw_data)
+    if state != correct:
+        return state
     state = checkHeaders(headers)
     if state != correct:
         return state
@@ -292,6 +296,14 @@ def check_http_request_validity(http_raw_data) -> HttpRequestState:
     return correct
 
 
+def checkCRLF(string):
+    if string[-4:] != "\r\n\r\n":
+        print("ERROR: CRLF")
+        return HttpRequestState.INVALID_INPUT
+    else:
+        return HttpRequestState.GOOD
+
+
 def resolveHost(path: str, headers):
     host = True
     if path.startswith("/"):
@@ -303,12 +315,14 @@ def resolveHost(path: str, headers):
     if host:
         return HttpRequestState.GOOD
     else:
+        print("ERROR: Host")
         return HttpRequestState.INVALID_INPUT
 
 
 def checkVersion(version:str):
     version = version.strip()[:version.find("\r\n")]
     if version != "HTTP/1.0" and version != "HTTP/1.1":
+        print("ERROR: Version")
         return HttpRequestState.INVALID_INPUT
     else:
         return HttpRequestState.GOOD
@@ -319,9 +333,11 @@ def checkHeaders(headers):
     for h in headers:
         line = h.split(":")
         if (len(line) < 2) or (len(line) > 3):
+            print("ERROR: Headers")
             return HttpRequestState.INVALID_INPUT
         elif len(line) == 3:
             if (line[0].strip() != "Host") or not(str.isnumeric(line[-1].strip())):
+                print("ERROR: Headers2")
                 return HttpRequestState.INVALID_INPUT
     return HttpRequestState.GOOD
 
@@ -332,6 +348,7 @@ def checkMethod(method):
     elif method in ["PUT", "POST", "DELETE", "HEAD"]:
         return HttpRequestState.NOT_SUPPORTED
     else:
+        print("ERROR: Method")
         return HttpRequestState.INVALID_INPUT
 
 
