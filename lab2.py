@@ -93,7 +93,7 @@ class HttpErrorResponse(object):
         self.message = message
 
     def to_http_string(self):
-        return f"{self.message} ({self.code})"
+        return f"{self.message} ({self.code})\n"
 
     def to_byte_array(self, http_string):
         """
@@ -132,7 +132,7 @@ def entry_point(proxy_port_number):
     inside it.
     """
 
-    proxy = setup_sockets(proxy_port_number)
+    proxy = setup_sockets(int(proxy_port_number))
     do_socket_logic(proxy)
 
 
@@ -166,7 +166,12 @@ def do_socket_logic(socket):
 
 
 def clientHandler(client, address):
-    request = client.recv(2 ** 10)
+    request = ""
+    count = 0
+    while request.find("\r\n\r\n") == -1 and count < 5:
+        received = client.recv(2 ** 10)
+        request += received.decode("unicode_escape")
+        count += 1
     response = http_request_pipeline(address, request)
     if isinstance(response, HttpErrorResponse):
         client.sendto(response.to_byte_array(response.to_http_string()), address)
@@ -175,8 +180,12 @@ def clientHandler(client, address):
         if r is None:
             r = fetchServer(response)
             cacheRequest(response, r)
-        for response in r:
-            client.sendto(response, address)
+        if r is not None:
+            if isinstance(r, list):
+                for response in r:
+                    client.sendto(response, address)
+            else:
+                client.sendto(r, address)
     client.close()
 
 
@@ -189,15 +198,21 @@ def checkCache(response):
 
 
 def cacheRequest(response, r):
-    cache[response.requested_host + response.requested_path] = r
+    if response != bytes("Unresolved Host", "UTF-8") and response != bytes("Request took too much time", "UTF-8"):
+        cache[response.requested_host + response.requested_path] = r
 
 
 def fetchServer(response):
     data = []
-    response.display()
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    IP = socket.gethostbyname(response.requested_host)
-    server.connect((IP, response.requested_port))
+    try:
+        IP = socket.gethostbyname(response.requested_host)
+    except Exception:
+        return bytes("Unresolved Host", "UTF-8")
+    try:
+        server.connect((IP, response.requested_port))
+    except TimeoutError:
+        return bytes("Request took too much time", "UTF-8")
     server.send(response.to_byte_array(response.to_http_string()))
     received_data = server.recv(2**15)
     while len(received_data) > 0:
@@ -221,7 +236,6 @@ def http_request_pipeline(source_addr, http_raw_data):
     free to change its content
     """
     # Parse HTTP request
-    http_raw_data = http_raw_data.decode("unicode_escape")
     validity = check_http_request_validity(http_raw_data)
     if validity != HttpRequestState.GOOD:
         http = generateError(validity)
@@ -256,13 +270,14 @@ def parse_headers(components):
     headers = []
     host = None
     for c in components:
-        splits = c.split(":")
+        splits = c.split(": ")
         h = [splits[0].strip(), splits[1].strip()]
-        if h[0] == "Host":
-            host = h[1]
         headers.append(h)
-        if len(splits) > 2:
-            port = int(splits[2])
+        if h[0] == "Host":
+            splits2 = h[1].split(":")
+            host = splits2[0]
+            if len(splits2) > 2:
+                port = int(splits2[1])
     return port, headers, host
 
 
@@ -272,7 +287,11 @@ def check_http_request_validity(http_raw_data: str) -> HttpRequestState:
     returns:
     One of values in HttpRequestState
     """
+    http_raw_data = http_raw_data.lower()
     correct = HttpRequestState.GOOD
+    state = checkRequestLine(http_raw_data.split("\r\n")[0])
+    if state != correct:
+        return state
     headers = http_raw_data.split("\r\n")[1:]
     method = http_raw_data.split(" ")[0]
     path = http_raw_data.split(" ")[1]
@@ -309,8 +328,8 @@ def resolveHost(path: str, headers):
     if path.startswith("/"):
         host = False
         for h in headers:
-            line = h.split(":")
-            if line[0].strip() == "Host":
+            line = h.split(": ")
+            if line[0].strip() == "host":
                 host = True
     if host:
         return HttpRequestState.GOOD
@@ -319,9 +338,9 @@ def resolveHost(path: str, headers):
         return HttpRequestState.INVALID_INPUT
 
 
-def checkVersion(version:str):
+def checkVersion(version: str):
     version = version.strip()[:version.find("\r\n")]
-    if version != "HTTP/1.0" and version != "HTTP/1.1":
+    if version != "http/1.0" and version != "http/1.1":
         print("ERROR: Version")
         return HttpRequestState.INVALID_INPUT
     else:
@@ -330,26 +349,37 @@ def checkVersion(version:str):
 
 def checkHeaders(headers):
     headers = list(filter(None, headers))
+    if headers is None or len(headers) == 0:
+        return HttpRequestState.GOOD
     for h in headers:
-        line = h.split(":")
+        line = h.split(": ")
         if (len(line) < 2) or (len(line) > 3):
             print("ERROR: Headers")
             return HttpRequestState.INVALID_INPUT
         elif len(line) == 3:
-            if (line[0].strip() != "Host") or not(str.isnumeric(line[-1].strip())):
+            if (line[0].strip() != "host") or not(str.isnumeric(line[-1].strip())):
                 print("ERROR: Headers2")
                 return HttpRequestState.INVALID_INPUT
     return HttpRequestState.GOOD
 
 
 def checkMethod(method):
-    if method == "GET":
+    if method == "get":
         return HttpRequestState.GOOD
-    elif method in ["PUT", "POST", "DELETE", "HEAD"]:
+    elif method in ["put", "post", "delete", "head"]:
         return HttpRequestState.NOT_SUPPORTED
     else:
         print("ERROR: Method")
         return HttpRequestState.INVALID_INPUT
+
+
+def checkRequestLine(request):
+    if request is None or request == "":
+        return HttpRequestState.INVALID_INPUT
+    elif len(request.split(" ")) != 3:
+        return HttpRequestState.INVALID_INPUT
+    else:
+        return HttpRequestState.GOOD
 
 
 def sanitize_http_request(request_info: HttpRequestInfo):
@@ -361,11 +391,20 @@ def sanitize_http_request(request_info: HttpRequestInfo):
     nothing, but modifies the input object
     """
     path = request_info.requested_path
-    if path.__contains__("http"):
-        index = path.find("/", 8)
-        index2 = path.find("//") + 2
-        host = path[index2:index]
-        relative = path[index:]
+    if not(path.startswith("/")):
+        if path.__contains__("http"):
+            index = path.find("/", 8)
+            index2 = path.find("//") + 2
+            host = path[index2:index]
+            relative = path[index:]
+        else:
+            index = path.find("/")
+            if index == -1:
+                host = path
+                relative = "/"
+            else:
+                host = path[:index]
+                relative = path[index:]
         if relative == "":
             relative = "/"
         if host.__contains__(":"):
@@ -439,3 +478,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
